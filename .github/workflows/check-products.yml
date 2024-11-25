@@ -1,0 +1,173 @@
+name: Check Anthropic Products
+
+on:
+  schedule:
+    - cron: '0 14 * * *'  # 9am EST (14:00 UTC)
+    - cron: '0 17 * * *'  # 12pm EST (17:00 UTC)
+    - cron: '0 20 * * *'  # 3pm EST (20:00 UTC)
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  check-products:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 python-dateutil
+
+      - name: Create product checker script
+        run: |
+          cat > check_products.py << 'EOL'
+          import os
+          import re
+          import json
+          import requests
+          from datetime import datetime, timezone
+          from dateutil import parser
+          
+          def search_brave(query):
+              url = "https://api.search.brave.com/res/v1/web/search"
+              headers = {"Accept": "application/json", "X-Subscription-Token": "${{ secrets.BRAVE_API_KEY }}"}
+              params = {"q": query}
+              
+              response = requests.get(url, headers=headers, params=params)
+              if response.status_code != 200:
+                  print(f"Error searching Brave: {response.status_code}")
+                  return []
+                  
+              return response.json().get('web', {}).get('results', [])
+          
+          def extract_date_from_content(content):
+              date_patterns = [
+                  r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+2024',
+                  r'\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+2024',
+                  r'2024-\d{2}-\d{2}'
+              ]
+              
+              for pattern in date_patterns:
+                  matches = re.findall(pattern, content)
+                  if matches:
+                      try:
+                          return parser.parse(matches[0])
+                      except:
+                          continue
+              return None
+          
+          def parse_existing_readme():
+              with open('README.md', 'r') as f:
+                  content = f.read()
+              
+              entries = []
+              for line in content.split('\n'):
+                  if line.startswith('- '):
+                      entries.append(line[2:])  # Remove "- " prefix
+              
+              return entries
+          
+          def update_readme(new_entries):
+              with open('README.md', 'r') as f:
+                  lines = f.readlines()
+              
+              # Find the section for 2024
+              section_start = -1
+              for i, line in enumerate(lines):
+                  if line.strip() == '### 2024':
+                      section_start = i + 1
+                      break
+              
+              if section_start == -1:
+                  print("Couldn't find 2024 section")
+                  return False
+              
+              # Update the entries
+              updated_lines = lines[:section_start]
+              for entry in new_entries:
+                  updated_lines.append(f'- {entry}\n')
+              
+              # Add the rest of the content
+              found_next_section = False
+              for line in lines[section_start:]:
+                  if line.startswith('###') or line.startswith('##'):
+                      found_next_section = True
+                  if found_next_section:
+                      updated_lines.append(line)
+              
+              # Update last checked date
+              current_time = datetime.now().strftime('%B %d, %Y')
+              for i, line in enumerate(updated_lines):
+                  if '*Last checked:' in line:
+                      updated_lines[i] = f'*Last checked: {current_time}*\n'
+                      break
+              
+              with open('README.md', 'w') as f:
+                  f.writelines(updated_lines)
+              
+              return True
+          
+          def main():
+              # Search for recent news
+              search_results = search_brave('anthropic launches product 2024 site:techcrunch.com OR site:reuters.com')
+              
+              # Extract and process entries
+              existing_entries = parse_existing_readme()
+              new_entries = set()
+              
+              for result in search_results:
+                  title = result.get('title', '')
+                  description = result.get('description', '')
+                  content = f"{title} {description}"
+                  
+                  # Look for product launches
+                  launch_keywords = ['launches', 'released', 'announces', 'unveils']
+                  if any(keyword in content.lower() for keyword in launch_keywords):
+                      date = extract_date_from_content(content)
+                      if date and date.year == 2024:
+                          entry = f"{date.strftime('%B %d')}: {title.split('|')[0].strip()}"
+                          if not any(existing.lower() in entry.lower() or entry.lower() in existing.lower() for existing in existing_entries):
+                              new_entries.add(entry)
+              
+              if new_entries:
+                  # Sort entries by date
+                  all_entries = sorted(list(new_entries) + existing_entries, 
+                                    key=lambda x: parser.parse(x.split(':')[0] + ', 2024'),
+                                    reverse=True)
+                  
+                  # Update README
+                  if update_readme(all_entries):
+                      print(f"Added {len(new_entries)} new entries")
+                      return True
+              
+              print("No new entries found")
+              return False
+          
+          if __name__ == '__main__':
+              main()
+          EOL
+
+      - name: Run product checker
+        env:
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+        run: python check_products.py
+
+      - name: Commit changes if needed
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add README.md
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Auto-update: Check for new Anthropic products"
+            git push
+          fi
